@@ -1,3 +1,9 @@
+#if defined(PIN_NEOPIXEL)
+  #define NUMPIXELS        1
+  #include <Adafruit_NeoPixel.h>
+  Adafruit_NeoPixel pixels(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+#endif
+
 
 #include <WiFi.h>
 #include <ArduinoJson.h>
@@ -25,19 +31,32 @@ unsigned long wifiMillis; //holds millis for counting up to hard reset for wifi 
 bool _debugMode = false;
 bool retain = true; //change to false to disable mqtt retain  
 
-void setup() {
-  if (redLedPin >= 0) {
-    pinMode(redLedPin, OUTPUT);
-    digitalWrite(redLedPin, HIGH);
-  }
-  if (blueLedPin >= 0) {
-    pinMode(blueLedPin, OUTPUT);
-    digitalWrite(blueLedPin, HIGH);
-  }
-  if (rgbLed >= 0) {
-    //Todo: use led_strip to control WS2812 LED
-  }
+enum class LedFunction
+{
+    Initial,
+    WifiTry,
+    WifiConnected,
+    MqttConnected,
+    MqttReceived
+};
 
+void setup() {
+  #if defined(PIN_NEOPIXEL)
+    #if defined(NEOPIXEL_POWER)
+      pinMode(NEOPIXEL_POWER, OUTPUT);
+      digitalWrite(NEOPIXEL_POWER, HIGH);
+    #endif
+    pixels.begin();
+    pixels.setBrightness(255);
+  #else
+    if (redLedPin >= 0) {
+      pinMode(redLedPin, OUTPUT);
+    }
+    if (blueLedPin >= 0) {
+      pinMode(blueLedPin, OUTPUT);
+    }
+  #endif
+  SetLed(LedFunction::Initial);
   WIFIConnect(); //connect to wifi
 
   // configure mqtt connection
@@ -56,7 +75,7 @@ void setup() {
     ArduinoOTA.begin();
   #endif
   
-  hp.connect(&Serial1);
+  hp.connect(&Serial1, rxPin, txPin);
 
   lastTempSend = millis();
   lastRemoteTemp = millis();
@@ -64,22 +83,19 @@ void setup() {
 
 void hpSettingsChanged() {
   const size_t bufferSize = JSON_OBJECT_SIZE(6);
-  DynamicJsonBuffer jsonBuffer(bufferSize);
-
-  JsonObject& root = jsonBuffer.createObject();
+  DynamicJsonDocument jsonBuffer(bufferSize);
 
   heatpumpSettings currentSettings = hp.getSettings();
 
-  root["power"]       = currentSettings.power;
-  root["mode"]        = currentSettings.mode;
-  root["temperature"] = (isCelsius) ? currentSettings.temperature: hp.CelsiusToFahrenheit(currentSettings.temperature);
-  root["fan"]         = currentSettings.fan;
-  root["vane"]        = currentSettings.vane;
-  root["wideVane"]    = currentSettings.wideVane;
+  jsonBuffer["power"]       = currentSettings.power;
+  jsonBuffer["mode"]        = currentSettings.mode;
+  jsonBuffer["temperature"] = (isCelsius) ? currentSettings.temperature: hp.CelsiusToFahrenheit(currentSettings.temperature);
+  jsonBuffer["fan"]         = currentSettings.fan;
+  jsonBuffer["vane"]        = currentSettings.vane;
+  jsonBuffer["wideVane"]    = currentSettings.wideVane;
  
   char buffer[512];
-  root.printTo(buffer, sizeof(buffer));
-
+  serializeJson(jsonBuffer, buffer, sizeof(buffer));
   if(!mqtt_client.publish(heatpump_topic, buffer, retain)) {
     mqtt_client.publish(heatpump_debug_topic, "failed to publish to heatpump topic");
   }
@@ -88,14 +104,13 @@ void hpSettingsChanged() {
 void hpStatusChanged(heatpumpStatus currentStatus) {
   // send room temp and operating info
   const size_t bufferSizeInfo = JSON_OBJECT_SIZE(2);
-  DynamicJsonBuffer jsonBufferInfo(bufferSizeInfo);
+  DynamicJsonDocument jsonBufferInfo(bufferSizeInfo);
   
-  JsonObject& rootInfo = jsonBufferInfo.createObject();
-  rootInfo["roomTemperature"] = (isCelsius) ? hp.getRoomTemperature() : hp.CelsiusToFahrenheit(hp.getRoomTemperature());
-  rootInfo["operating"]       = currentStatus.operating;
+  jsonBufferInfo["roomTemperature"] = (isCelsius) ? hp.getRoomTemperature() : hp.CelsiusToFahrenheit(hp.getRoomTemperature());
+  jsonBufferInfo["operating"]       = currentStatus.operating;
   
   char bufferInfo[512];
-  rootInfo.printTo(bufferInfo, sizeof(bufferInfo));
+  serializeJson(jsonBufferInfo, bufferInfo, sizeof(bufferInfo));
 
   if(!mqtt_client.publish(heatpump_status_topic, bufferInfo, true)) {
     mqtt_client.publish(heatpump_debug_topic, "failed to publish to room temp and operation status to heatpump/status topic");
@@ -103,17 +118,16 @@ void hpStatusChanged(heatpumpStatus currentStatus) {
 
   // send the timer info
   const size_t bufferSizeTimers = JSON_OBJECT_SIZE(5);
-  DynamicJsonBuffer jsonBufferTimers(bufferSizeTimers);
+  DynamicJsonDocument jsonBufferTimers(bufferSizeTimers);
   
-  JsonObject& rootTimers = jsonBufferTimers.createObject();
-  rootTimers["mode"]          = currentStatus.timers.mode;
-  rootTimers["onMins"]        = currentStatus.timers.onMinutesSet;
-  rootTimers["onRemainMins"]  = currentStatus.timers.onMinutesRemaining;
-  rootTimers["offMins"]       = currentStatus.timers.offMinutesSet;
-  rootTimers["offRemainMins"] = currentStatus.timers.offMinutesRemaining;
+  jsonBufferTimers["mode"]          = currentStatus.timers.mode;
+  jsonBufferTimers["onMins"]        = currentStatus.timers.onMinutesSet;
+  jsonBufferTimers["onRemainMins"]  = currentStatus.timers.onMinutesRemaining;
+  jsonBufferTimers["offMins"]       = currentStatus.timers.offMinutesSet;
+  jsonBufferTimers["offRemainMins"] = currentStatus.timers.offMinutesRemaining;
 
   char bufferTimers[512];
-  rootTimers.printTo(bufferTimers, sizeof(bufferTimers));
+  serializeJson(jsonBufferTimers, bufferTimers, sizeof(bufferTimers));
 
   if(!mqtt_client.publish(heatpump_timers_topic, bufferTimers, true)) {
     mqtt_client.publish(heatpump_debug_topic, "failed to publish timer info to heatpump/status topic");
@@ -131,14 +145,12 @@ void hpPacketDebug(byte* packet, unsigned int length, char* packetDirection) {
     }
 
     const size_t bufferSize = JSON_OBJECT_SIZE(1);
-    DynamicJsonBuffer jsonBuffer(bufferSize);
+    DynamicJsonDocument jsonBuffer(bufferSize);
 
-    JsonObject& root = jsonBuffer.createObject();
-
-    root[packetDirection] = message;
+    jsonBuffer[packetDirection] = message;
 
     char buffer[512];
-    root.printTo(buffer, sizeof(buffer));
+    serializeJson(jsonBuffer, buffer, sizeof(buffer));
 
     if(!mqtt_client.publish(heatpump_debug_topic, buffer)) {
       mqtt_client.publish(heatpump_debug_topic, "failed to publish to heatpump/debug topic");
@@ -157,52 +169,51 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, heatpump_set_topic) == 0) { //if the incoming message is on the heatpump_set_topic topic...
     // Parse message into JSON
     const size_t bufferSize = JSON_OBJECT_SIZE(6);
-    DynamicJsonBuffer jsonBuffer(bufferSize);
-    JsonObject& root = jsonBuffer.parseObject(message);
-
-    if (!root.success()) {
+    DynamicJsonDocument jsonBuffer(bufferSize);
+    DeserializationError error = deserializeJson(jsonBuffer, message);
+    if (error) {
       mqtt_client.publish(heatpump_debug_topic, "!root.success(): invalid JSON on heatpump_set_topic...");
       return;
     }
-
+    SetLed(LedFunction::MqttReceived);
     // Step 3: Retrieve the values
-    if (root.containsKey("power")) {
-      String power = root["power"];
+    if (jsonBuffer.containsKey("power")) {
+      String power = jsonBuffer["power"];
       hp.setPowerSetting(power.c_str());
     }
 
-    if (root.containsKey("mode")) {
-      String mode = root["mode"];
+    if (jsonBuffer.containsKey("mode")) {
+      String mode = jsonBuffer["mode"];
       hp.setModeSetting(mode.c_str());
     }
 
-    if (root.containsKey("temperature")) {
-      float temperature = (isCelsius) ? root["temperature"]: hp.FahrenheitToCelsius(root["temperature"]);
+    if (jsonBuffer.containsKey("temperature")) {
+      float temperature = (isCelsius) ? jsonBuffer["temperature"]: hp.FahrenheitToCelsius(jsonBuffer["temperature"]);
       hp.setTemperature( temperature ); 
     }
 
-    if (root.containsKey("fan")) {
-      String fan = root["fan"];
+    if (jsonBuffer.containsKey("fan")) {
+      String fan = jsonBuffer["fan"];
       hp.setFanSpeed(fan.c_str());
     }
 
-    if (root.containsKey("vane")) {
-      String vane = root["vane"];
+    if (jsonBuffer.containsKey("vane")) {
+      String vane = jsonBuffer["vane"];
       hp.setVaneSetting(vane.c_str());
     }
 
-    if (root.containsKey("wideVane")) {
-      String wideVane = root["wideVane"];
+    if (jsonBuffer.containsKey("wideVane")) {
+      String wideVane = jsonBuffer["wideVane"];
       hp.setWideVaneSetting(wideVane.c_str());
     }
 
-    if(root.containsKey("remoteTemp")) {
-      float remoteTemp = (isCelsius) ? root["remoteTemp"]: hp.FahrenheitToCelsius(root["remoteTemp"]);
+    if(jsonBuffer.containsKey("remoteTemp")) {
+      float remoteTemp = (isCelsius) ? jsonBuffer["remoteTemp"]: hp.FahrenheitToCelsius(jsonBuffer["remoteTemp"]);
       hp.setRemoteTemperature( remoteTemp ); 
       lastRemoteTemp = millis();
     }
-    else if (root.containsKey("custom")) {
-      String custom = root["custom"];
+    else if (jsonBuffer.containsKey("custom")) {
+      String custom = jsonBuffer["custom"];
 
       // copy custom packet to char array
       char buffer[(custom.length() + 1)]; // +1 for the NULL at the end
@@ -262,6 +273,7 @@ void mqttConnect() {
       }
     }
   }
+  SetLed(LedFunction::MqttConnected);
 }
 
 void WIFIConnect() { //wifi reconnect
@@ -271,22 +283,57 @@ void WIFIConnect() { //wifi reconnect
   WiFi.begin(ssid, password);
   wifiMillis = millis(); //start "timer"
   while (WiFi.status() != WL_CONNECTED) { //sit here indefinitely trying to connect
-    // wait 500ms, flashing the blue LED to indicate WiFi connecting...
-    if (blueLedPin >= 0) {
-      digitalWrite(blueLedPin, LOW);
-      delay(250);
-      digitalWrite(blueLedPin, HIGH);
-      delay(250);
-    }
-    else if (rgbLed > 0)
-    {
-      //Todo: use led_strip to control WS2812 LED
-      delay(500);
-    }
-    else {
-      delay(500);
-    }
+    SetLed(LedFunction::WifiTry);
     if ((unsigned long)(millis() - wifiMillis) >= 20000) break;
+  }
+  SetLed(LedFunction::WifiConnected);
+}
+
+void SetLed(LedFunction function) {
+  uint32_t color;
+  uint32_t delayTime = 0;
+  uint8_t bluePin = LOW;
+  uint8_t redPin = LOW;
+  switch (function)
+  {
+    case LedFunction::Initial:
+      color = 0x00FF0000;
+      break;
+    case LedFunction::WifiTry:
+      color = 0x00FFFF00;
+      delayTime = 100;
+      redPin = HIGH;
+      break;
+    case LedFunction::WifiConnected:
+      color = 0x000000FF;
+      bluePin = HIGH;
+      break;
+    case LedFunction::MqttConnected:
+      color = 0x00001000;
+      break;
+    case LedFunction::MqttReceived:
+      color = 0x000FF000;
+      delayTime = 10;
+      redPin = HIGH;
+      bluePin = HIGH;
+      break;
+  }
+  #if defined(PIN_NEOPIXEL)
+    pixels.fill(color);
+    pixels.show();
+  #else
+    if (blueLedPin > 0)
+    {
+      digitalWrite(blueLedPin, bluePin);
+    }
+    if (redLedPin > 0)
+    {
+      digitalWrite(redLedPin, redPin);
+    }
+  #endif
+  if (delayTime > 0)
+  {
+    delay(delayTime);
   }
 }
 
@@ -296,11 +343,9 @@ void loop() {
   {
      WIFIConnect();
   } else {
-  
     if (!mqtt_client.connected()) {
       mqttConnect();
     }
-  
     hp.sync();
   
     if ((unsigned long)(millis() - lastTempSend) >= SEND_ROOM_TEMP_INTERVAL_MS) { //only send the temperature every 60s (default)  
@@ -314,7 +359,7 @@ void loop() {
     }
     
     mqtt_client.loop();
-    
+    SetLed(LedFunction::MqttConnected);
   #ifdef OTA
      ArduinoOTA.handle();
   #endif
